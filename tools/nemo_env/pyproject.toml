@@ -1,0 +1,20 @@
+[project]
+name = "nemotron-diar-trt-nemo-env"
+version = "0"
+description = "NeMo reference environment for tools/nemo_ref.py and tools/parity.py (not a dependency of the package)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "nemo-toolkit[asr]",
+    "numpy",
+    "pyyaml",
+    "soundfile",
+    "huggingface-hub",
+]
+
+[tool.uv]
+package = false
+constraint-dependencies = ["torch==2.14.0"]  # the torch the reference numbers were measured with
+
+[tool.uv.sources]
+# the NeMo Speech commit all reference numbers in README.md were measured with
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech", rev = "cf724ac337d1ebc7d0dda1e23fb80916f52927a5" }

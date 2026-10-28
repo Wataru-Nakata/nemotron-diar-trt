@@ -1,0 +1,9 @@
+[project]
+name = "nemotron-diar-trt-der"
+version = "0"
+description = "DER scoring for tools/der.py (CPU only)"
+requires-python = ">=3.10"
+dependencies = ["pyannote.metrics", "numpy", "soundfile"]
+
+[tool.uv]
+package = false

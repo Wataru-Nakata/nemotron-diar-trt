@@ -1,0 +1,75 @@
+#!/bin/bash
+# Run commands on one H200 with the prebuilt torch/TensorRT env (submit through scripts/qsub_pool.sh).
+#   scripts/qsub_pool.sh "CMD=tools/bench.py~--out~@,REF_CMD=tools/nemo_ref.py~--out~@" [walltime]
+# CMD is a python script (relative to the repo) and its arguments; '@' stands for this job's output dir and
+# '~' for a space (qsub -v splits its list at commas and is unreliable with spaces).
+# REF_CMD (optional) runs first in the NeMo reference env (.cache/envs/nemo-ref.tar.zst, built by
+# scripts/build_env_tar.sh ref from tools/nemo_env), with this repo's src on PYTHONPATH so both
+# implementations can run in one process. Local settings (ENV_TAR, NEMOTRON_DIAR_MODEL, NEMOTRON_DIAR_DATA, ...)
+# are read from .cache/job.env if it exists.
+# A CMD ending in .sh runs with bash, with $PY (this env's python), $REF_PY (the NeMo env's; pass REF_ENV=1
+# to unpack it without a REF_CMD) and $OUT set. Both envs are unpacked onto node-local disk.
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -euo pipefail
+CMD="${CMD:-}" REF_CMD="${REF_CMD:-}"
+CMD="${CMD//\~/ }" REF_CMD="${REF_CMD//\~/ }"
+: "${PBS_JOBID:?run via qsub}"
+: "${PBS_LOCALDIR:?run via qsub}"
+cd "$PBS_O_WORKDIR"
+REPO=$PWD
+if [ -f "$REPO/.cache/job.env" ]; then set -a; . "$REPO/.cache/job.env"; set +a; fi
+OUT="$REPO/outputs/job-${PBS_JOBID%%.*}"
+mkdir -p "$OUT"
+export TMPDIR="$PBS_LOCALDIR/tmp" && mkdir -p "$TMPDIR"
+export TRITON_CACHE_DIR="$PBS_LOCALDIR/triton" TORCHINDUCTOR_CACHE_DIR="$PBS_LOCALDIR/inductor"
+export NEMOTRON_DIAR_TRT_CACHE="${NEMOTRON_DIAR_TRT_CACHE:-$REPO/.cache/engines}"
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}" HF_HUB_OFFLINE=1
+export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=8
+
+# Snapshot the code so edits made while the job is queued/running cannot leak into it.
+SNAP="$PBS_LOCALDIR/snap"
+mkdir -p "$SNAP" && cp -r src scripts tests tools "$SNAP/"
+git rev-parse --short HEAD > "$OUT/commit.txt" 2>/dev/null || true
+git status --short > "$OUT/status.txt" 2>/dev/null || true
+
+nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv -l 5 > "$OUT/nvidia-smi.csv" &
+SMI=$!
+trap 'kill $SMI 2>/dev/null || true' EXIT
+
+ZSTD="$(command -v zstd || echo "$HOME/miniconda3/bin/zstd")"
+unpack() {  # Lustre is slow with the ~100k small files of torch/NeMo: run envs from node-local disk
+  local t0=$SECONDS
+  "$ZSTD" -dc -T0 "$1" | tar -xf - -C "$PBS_LOCALDIR"
+  echo "unpacked $(basename "$1") in $((SECONDS - t0))s"
+}
+# The NeMo reference env (scripts/build_env_tar.sh ref): NeMo Speech at the pinned commit (tools/nemo_env).
+REF_TAR="${REF_TAR:-$REPO/.cache/envs/nemo-ref.tar.zst}"
+REF_PY="env -u CONDA_PREFIX PYTHONPATH=$SNAP/src:$SNAP PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+REF_PY="$REF_PY $PBS_LOCALDIR/nemo-ref/bin/python3"
+if [ -n "${REF_CMD:-}" ] || [ -n "${REF_ENV:-}" ]; then
+  unpack "$REF_TAR"
+fi
+if [ -n "${REF_CMD:-}" ]; then
+  echo "=== reference: $REF_CMD"
+  # shellcheck disable=SC2086
+  (cd "$SNAP" && timeout "${REF_TIMEOUT:-3000}" $REF_PY ${REF_CMD//@/$OUT}) 2>&1 | tee "$OUT/ref.log"
+fi
+
+if [ -n "${CMD:-}" ]; then
+  # torch + TensorRT with this package's dependencies (scripts/build_env_tar.sh main); this package comes from
+  # the snapshot through PYTHONPATH. The tar holds one directory named like the tar.
+  ENV_TAR="${ENV_TAR:-$REPO/.cache/envs/nemotron-env.tar.zst}"
+  unpack "$ENV_TAR"
+  PYARR=(env -u CONDA_PREFIX PYTHONPATH="$SNAP/src:$SNAP" "$PBS_LOCALDIR/$(basename "$ENV_TAR" .tar.zst)/bin/python3")
+  nvidia-smi
+  echo "=== $CMD"
+  if [[ "$CMD" == *.sh* ]]; then
+    export PY="${PYARR[*]}" REF_PY OUT SNAP REPO
+    # shellcheck disable=SC2086
+    (cd "$SNAP" && timeout "${CMD_TIMEOUT:-3300}" bash ${CMD//@/$OUT}) 2>&1 | tee "$OUT/run.log"
+  else
+    # shellcheck disable=SC2086
+    (cd "$SNAP" && timeout "${CMD_TIMEOUT:-3300}" "${PYARR[@]}" ${CMD//@/$OUT}) 2>&1 | tee "$OUT/run.log"
+  fi
+fi
